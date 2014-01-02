@@ -28,9 +28,12 @@ import com.twitter.scalding.GroupBuilder
 import com.twitter.scalding.TupleConversions
 import com.twitter.scalding.mathematics.Matrix
 import com.twitter.scalding.mathematics.RowVector
+import com.twitter.algebird.MinHasher32
 
 import org.kiji.express.repl.Implicits.pipeToRichPipe
+import org.kiji.express.repl.Implicits.richPipeToPipe
 import org.kiji.modeling.framework.ModelPipeConversions
+
 
 // For implicit conversions
 import Matrix._
@@ -80,6 +83,156 @@ class RecommendationPipe(val pipe: Pipe)
           }
         }
         .map(toFields -> toFields) { itemSets: Seq[T] => itemSets.mkString(separator) }
+  }
+
+  /**
+   * This function calculates a minhash signature for a sparse vector using the provided
+   * minhasher.
+   *
+   * @param sparseVector the item's sparse vector representation as a Seq[T]
+   * @param minHasher an instance of Algebird's Minhasher32 class. This is a minhasher which uses
+   *    a 4 byte hash for each element.
+   * @tparam T is the data type of the elements in an item's sparse vector representation.
+   *    The allowed types are : Char, Short, Int, Float, Long, Double, String, Array[Byte],
+   *    Array[Char], Array[Short], Array[Int], Array[Float], Array[Long] & Array[Double].
+   * @return a byte array representing the minhash signature of the sparse vector.
+   */
+  private
+    def minHashSignatureForSparseVector[T]( sparseVector : Seq[T], minHasher : MinHasher32 )
+                                          ( implicit ordering : Ordering[T] ) : Array[Byte] = {
+    // Get rid of 'Convert match to partial function' warning
+    sparseVector.map {
+      case x : Char => minHasher.init { _( x ) }
+      case x : Short => minHasher.init { _( x ) }
+      case x : Int => minHasher.init { _( x ) }
+      case x : Float => minHasher.init { _( x ) }
+      case x : Long => minHasher.init { _( x ) }
+      case x : Double => minHasher.init { _( x ) }
+      case x : String => minHasher.init { _( x ) }
+      case x : Array[Byte] => minHasher.init { _( x ) }
+      case x : Array[Char] => minHasher.init { _( x ) }
+      case x : Array[Short] => minHasher.init { _( x ) }
+      case x : Array[Int] => minHasher.init { _( x ) }
+      case x : Array[Float] => minHasher.init { _( x ) }
+      case x : Array[Long] => minHasher.init { _( x ) }
+      case x : Array[Double] => minHasher.init { _( x ) }
+      case _ =>
+        throw new IllegalArgumentException( "The allowed types to represent an item's" +
+            "vector are : Char, Short, Int, Float, Long, Double, String, Array[Byte], " +
+            "Array[Char], Array[Short], Array[Int], Array[Float], Array[Long] & " +
+            "Array[Double]." )
+    }.reduce( minHasher.plus )
+  }
+
+  /**
+   * This function uses Locality Sensitive Hashing (LSH) with Jaccard similarity as the similarity
+   * metric to find similar items in a massive collection. An 'item' is anything with a
+   * high-dimensional, sparse vector representation. E.g. a product sold by a retailer can be
+   * represented by a vector containing the IDs of the customers who have purchased it.
+   *
+   * @param fieldSpec mapping from 2 fields (The first field contains an item's ID and the
+   *    second field contains it's vector representation) to 2 fields
+   *    (The first field contains an item's ID and the second field contains
+   *    a list of IDs of other items in the collection similar to it).
+   * @param signatureLength is the number of hash functions to use while compressing an item's
+   *    sparse vector to a short MinHash signature. Default = 128.
+   * @param similarity is the minimum fractional value, corresponding to the intersection of two
+   *    items divided by their union, above which items should be considered
+   *    similar.  Default = 0.8
+   * @param numCommonBuckets is the minimum number of common buckets that 2 items' Minhash
+   *    signatures should hash to, in order for them to be considered
+   *    similar. Default = 2
+   * @tparam T is the data type of the elements in an item's sparse vector representation.
+   *    The allowed types are : Char, Short, Int, Float, Long, Double, String, Array[Byte],
+   *    Array[Char], Array[Short], Array[Int], Array[Float], Array[Long] & Array[Double].
+   * @tparam H is the data type of an item's ID.
+   * @return a RichPipe with the specified output fields that contain all the items that were found
+   *    to be similar in the collection.
+   */
+  def findSimilarItemsUsingLocalitySensitiveHashing[T, H]( fieldSpec: ( Fields, Fields ),
+      signatureLength : Int = 128,
+      similarity : Double = 0.8,
+      numCommonBuckets : Int = 2 )
+      ( implicit elementOrdering : Ordering[T], IdOrdering : Ordering[H] ) : Pipe = {
+
+    require( ( fieldSpec._1.size() == 2 ) && ( fieldSpec._2.size() == 2 ),
+        "fieldSpec : specify mapping from 2 fields " +
+        "(The first field contains an item\'s ID and the second field contains an item\'s " +
+        "vector representation) to 2 fields (The first field contains the item\'s ID and the " +
+        "second field contains a list of IDs of other items in the collection similar to it)." )
+
+    require( signatureLength > 0, "signatureLength : Signature length can only be a " +
+        "positive integer" )
+
+    require( ( similarity > 0.0 ) && ( similarity <= 1.0 ),
+        "similarity : Similarity must lie within (0.0, 1.0]" )
+
+    require( numCommonBuckets > 0, "numCommonBuckets : The minimum number of buckets that " +
+        "two items need to hash to in order to be considered similar cannot be zero or " +
+        "negative." )
+
+    val ( documentFields, resultFields ) = fieldSpec
+
+    // MinHasher32 is initialized with a similarity threshold and the number of bytes to allocate
+    // for an item's MinHash signature. In MinHasher32, the length of each hash in the signature
+    // is 4 bytes.
+    val minHasher = new MinHasher32( similarity, signatureLength * 4 )
+
+    // Calculate MinHash signatures of all the items, hash them to buckets and emit tuples
+    // to indicate all the buckets that all the items belong to.
+    pipe
+        .flatMapTo( documentFields -> ( 'bucketId, 'bucketMember ) ) {
+          itemTuple : ( H, Seq[T] ) => {
+            val itemId = itemTuple._1
+            val sparseVector = itemTuple._2
+
+            // Emitting 'bucketId' and 'itemId' tuples for each item. The 'bucketId's are obtained
+            // by hashing the item's minhash ignature into buckets.
+            minHasher.buckets( minHashSignatureForSparseVector( sparseVector, minHasher ) )
+                .map( ( _, itemId ) )
+          }
+        }
+
+        // Group all the items that belong to the same buckets
+        .groupBy( 'bucketId ) { _.toList[H] ( 'bucketMember -> 'bucketMembers ) }
+
+        // Discard the buckets that have zero or one item. These do not help in determining
+        // any kind of similarity.
+        .filter( 'bucketMembers ) { bucketMembers : List[H] => bucketMembers.size > 1 }
+
+        // Emit pairs of all the items that are in the same bucket
+        .flatMapTo( ( 'bucketId, 'bucketMembers ) -> ( 'sameBucketItem1, 'sameBucketItem2 ) ) {
+          bucketTuple : ( Long, List[H] ) => {
+            bucketTuple._2.combinations(2).toList.flatMap {
+              sameBucketPair : List[H] =>
+                List( ( sameBucketPair(0), sameBucketPair(1) ),
+                    ( sameBucketPair(1), sameBucketPair(0) ) )
+            }
+          }
+        }
+
+        // Short-circuit the calculation if
+        .then { tempPipe : Pipe =>
+          if ( numCommonBuckets > 1 ) {
+            tempPipe
+                // Count the # of buckets that each pair of items appears in
+                .groupBy( 'sameBucketItem1, 'sameBucketItem2 ) { _.size( 'numCommonBuckets ) }
+
+                // Discard the pairs of items that appear in fewer buckets than the user specified
+                // threshold
+                .filter( 'numCommonBuckets ) { buckets : Int => buckets >= numCommonBuckets }
+                .discard( 'numCommonBuckets )
+          } else {
+            tempPipe
+          }
+        }
+
+        // Consolidate all the recommendations per item
+        .rename( ( 'sameBucketItem1, 'sameBucketItem2 ) -> ( 'itemId, 'similarItemId ) )
+        .groupBy( 'itemId ) { _.toList[H] ( 'similarItemId -> 'similarItemIds ) }
+
+        // Rename the fields in the pipe to what the user expects.
+        .rename( ( 'itemId, 'similarItemIds ) -> resultFields )
   }
 
   /**

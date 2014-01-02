@@ -22,6 +22,8 @@ package org.kiji.modeling.lib
 import java.io.File
 import scala.collection.mutable
 import scala.math.abs
+import scala.util.Random
+import scala.compat.Platform
 
 import cascading.pipe.Pipe
 import cascading.tuple.Fields
@@ -51,13 +53,19 @@ import org.kiji.schema.avro.TableLayoutDesc
 import org.kiji.schema.layout.KijiTableLayouts
 import org.kiji.schema.util.InstanceBuilder
 
+
+
 @RunWith(classOf[JUnitRunner])
 class RecommendationPipeSuite extends KijiSuite {
   private val logger: Logger = LoggerFactory.getLogger(classOf[RecommendationPipeSuite])
   val testLayoutDesc: TableLayoutDesc = KijiTableLayouts.getLayout(KijiTableLayouts.SIMPLE)
   testLayoutDesc.setName("OrdersTable")
 
-  // The data consists of the following 3 orders stored in a Kiji table:
+  // Instantiating a SimilarVectorGenerator to be used while performing tests on
+  // findSimilarItemsUsingLocalitySensitiveHashing
+  val similarVectorGenerator = new SimilarVectorGenerator(10000)
+
+  // The data consists of a Kiji table with the following 3 orders:
   // {milk, bread, coke}
   // {milk, bread, butter, flour}
   // {butter, flour}
@@ -77,6 +85,7 @@ class RecommendationPipeSuite extends KijiSuite {
   val inputUri: KijiURI = doAndRelease(kiji.openTable("OrdersTable")) {
     table: KijiTable => table.getURI
   }
+
   // Hack to set the mode correctly. Scalding sets the mode in JobTest
   // which makes the tests below run in HadoopTest mode instead of Hadoop mode whenever they are
   // run after another test that uses JobTest.
@@ -296,6 +305,105 @@ class RecommendationPipeSuite extends KijiSuite {
   }
 
   /**
+   * This test checks whether findSimilarItems generates any false negatives while finding
+   * similar items. It runs on a dataset of two items which are 90% similar and uses
+   * a similarity threshold of 0.8 (80%).
+   */
+  test( "findSimilarItems does not generate false negatives" ) {
+
+    class FindSimilarItemsNoFalseNegativesJob( args : Args ) extends KijiModelingJob( args ) {
+      TextLine( args( "input" ) )
+          .read
+          .map( ( 'offset, 'line ) -> ( 'productId, 'userIds ) ) {
+            lineTuple : ( Int, String ) => {
+              val productId = lineTuple._1
+              val userIdSparseVector = lineTuple._2
+              ( productId,
+                  userIdSparseVector.split( "," ).toList )
+            }
+          }
+          .findSimilarItemsUsingLocalitySensitiveHashing[Int, Int]( ( ( 'productId, 'userIds ),
+              ( 'productId, 'similarProducts ) ), similarity = 0.8 )
+
+          .mapTo( ( 'productId, 'similarProducts ) -> 'result){
+            productTuple : ( Int, List[Int] ) =>
+              productTuple._1 + "\t" +  productTuple._2.sorted.mkString( "|" )
+          }
+          .write( TextLine( args( "output" ) ) )
+    }
+
+    val input : Seq[( Int, String )] = Seq(
+        ( 1, similarVectorGenerator.primaryVector.mkString( "," ) ),
+        ( 2, similarVectorGenerator.similarVector( 0.9 ).mkString( "," ) ) )
+
+    val expectedOutput = Set(
+        "1\t2",
+        "2\t1"
+    )
+
+    def validateOutput( output : mutable.Buffer[String] ) : Unit = {
+      val actual : Set[String] = output.toSet
+      assert( actual === expectedOutput )
+    }
+
+    val jobTest = JobTest( new FindSimilarItemsNoFalseNegativesJob( _ ) )
+        .arg( "input", "inputFile" )
+        .arg( "output", "outputFile" )
+        .source( TextLine( "inputFile" ), input )
+        .sink( TextLine( "outputFile" ) ) { validateOutput }
+
+    jobTest.run.finish
+  }
+
+  /**
+   * This test checks whether findSimilarItems generates any false positives while finding
+   * similar items. It runs on a dataset of two items which are 70% similar and uses a
+   * similarity threshold of 0.8 (80%).
+   */
+  test( "findSimilarItems does not generate false positives" ) {
+
+    class FindSimilarItemsNoFalsePositivesJob( args : Args ) extends KijiModelingJob( args ) {
+      TextLine( args( "input" ) )
+          .read
+          .map( ( 'offset, 'line ) -> ( 'productId, 'userIds ) ) {
+            lineTuple : ( Int, String ) => {
+              val productId = lineTuple._1
+              val userIdSparseVector = lineTuple._2
+              ( productId,
+                  userIdSparseVector.split( "," ).toList )
+            }
+          }
+          .findSimilarItemsUsingLocalitySensitiveHashing[Int, Int]( ( ( 'productId, 'userIds ),
+          ( 'productId, 'similarProducts ) ), similarity = 0.8 )
+
+          .mapTo( ( 'productId, 'similarProducts ) -> 'result){
+            productTuple : ( Int, List[Int] ) =>
+              productTuple._1 + "\t" +  productTuple._2.sorted.mkString( "|" )
+          }
+          .write( TextLine( args( "output" ) ) )
+    }
+
+    val input : Seq[( Int, String )] = Seq(
+      ( 1, similarVectorGenerator.primaryVector.mkString( "," ) ),
+      ( 2, similarVectorGenerator.similarVector( 0.7 ).mkString( "," ) ) )
+
+    val expectedOutput = Set()
+
+    def validateOutput( output : mutable.Buffer[String] ) : Unit = {
+      val actual : Set[String] = output.toSet
+      assert( actual === expectedOutput )
+    }
+
+    val jobTest = JobTest( new FindSimilarItemsNoFalsePositivesJob( _ ) )
+        .arg( "input", "inputFile" )
+        .arg( "output", "outputFile" )
+        .source( TextLine( "inputFile" ), input )
+        .sink( TextLine( "outputFile" ) ) { validateOutput }
+
+    jobTest.run.finish
+  }
+
+  /**
    * Utility function to test difference item-item similarity metrics.
    *
    * @param userRatings List of user ratings (essentially the user-item rating matrix).
@@ -477,4 +585,41 @@ class RecommendationPipeSuite extends KijiSuite {
     jobTest.run.finish
   }
 
+  /**
+   * A convenience class for generating a set of similar vectors of a specified length.
+   * Jaccard similarity is the similarity metric used.
+   *
+   * @param size specifies the length of vectors to be generated
+   */
+  class SimilarVectorGenerator(size : Int){
+    private val rand : Random = new Random(Platform.currentTime)
+    var primaryVector : Set[Int] = (1 to size).toSet
+
+    /**
+     * Returns a vector of same length and specified Jaccard similarity to the primary vector.
+     *
+     * @param similarity is the Jaccard similarity of the primary vector to the vector being
+     * generated. A value in the range [0.0, 1.0].
+     * @return a Set[Int] of same length as and specified similarity to the primary vector.
+     */
+    def similarVector(similarity : Double) : Set[Int] = {
+      // Calculating the fraction of common elements two vectors of equal length need to have
+      // to achieve a certain value of Jaccard similarity.
+      val threshold: Double = (2 * similarity)/(1 + similarity)
+
+      primaryVector.map{
+        element : Int =>
+          val offset = size + 1
+          if (rand.nextDouble() > threshold){
+            var nextElement : Int = rand.nextInt().abs + offset
+            while (primaryVector.contains(nextElement)){
+              nextElement = rand.nextInt().abs + offset
+            }
+            nextElement
+          }else{
+            element
+          }
+      }
+    }
+  }
 }
